@@ -198,3 +198,71 @@ If you use Browser Use in your research or project, please cite:
 <div align="center">
 Made with ❤️ in Zurich and San Francisco
  </div>
+
+# Human-Like Browser Interaction
+
+This fork of [browser-use](https://github.com/cohere-ai/browser-use) adds realistic human-like mouse movements and typing behaviors to create more natural browser interactions.
+
+## Features
+
+- **Realistic Mouse Movements**: The mouse cursor now follows a human-like path with natural acceleration and deceleration when interacting with elements.
+- **Varied Mouse Movement Patterns**: Choose between linear, bezier curve, or human-like movement patterns.
+- **Natural Typing Behavior**: Characters are typed with variable delays between keystrokes.
+- **Configurable Behavior**: Adjust speed, variation, and movement patterns to match specific use cases.
+
+## Usage
+
+To enable human-like interactions, create a `BrowserProfile` with the appropriate settings:
+
+```python
+from browser_use.browser.profile import BrowserProfile
+
+# Create a profile with human-like behaviors
+human_profile = BrowserProfile(
+    use_human_like_mouse=True,                # Enable human-like mouse movements
+    mouse_movement_pattern="human",           # Use the most realistic pattern
+    min_mouse_movement_time=0.3,              # Minimum time to complete a movement
+    max_mouse_movement_time=1.0,              # Maximum time to complete a movement
+    mouse_speed_variation=0.4,                # Amount of speed variation
+    headless=False                            # Set to False to see the movements
+)
+
+# Use this profile with your agent
+agent = Agent(
+    task, 
+    model, 
+    controller=controller, 
+    use_vision=True,
+    browser_profile=human_profile
+)
+```
+
+## Movement Patterns
+
+The following mouse movement patterns are available:
+
+- **linear**: Simple straight line movement from point A to point B.
+- **bezier**: Curved movement using quadratic bezier curves, more natural than linear.
+- **human**: The most realistic pattern with slight variations, acceleration/deceleration, and occasional small errors.
+
+## Example
+
+Check out the example in `examples/use-cases/check_appointment_human.py` which demonstrates how to use this functionality.
+
+## Why Add Human-Like Interactions?
+
+1. **Avoiding Bot Detection**: Many websites use behavioral analysis to detect bots. Human-like interactions can help avoid detection.
+2. **Testing User Experience**: More accurately simulate real user behavior for testing websites and applications.
+3. **Training AI Agents**: Provide more realistic interactions when training AI agents to use web interfaces.
+
+## Implementation Details
+
+The human-like behavior is implemented through:
+
+1. `MouseMovementService`: Generates and executes realistic mouse movements.
+2. Modified interaction methods in `BrowserSession`: Uses the mouse service before clicks and inputs.
+3. Configuration options in `BrowserProfile`: Controls the behavior of the movements.
+
+## Credits
+
+This project is a fork of [browser-use](https://github.com/cohere-ai/browser-use) with enhancements for human-like interactions.

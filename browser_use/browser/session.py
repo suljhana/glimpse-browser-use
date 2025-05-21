@@ -2,33 +2,42 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import enum
 import json
 import logging
 import os
+import random
 import re
 import time
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, Dict, List, Optional, Self, Set, Tuple, cast, Union
 
 import psutil
-from patchright.async_api import Playwright as PatchrightPlaywright
-from playwright.async_api import Browser as PlaywrightBrowser
-from playwright.async_api import BrowserContext as PlaywrightBrowserContext
-from playwright.async_api import ElementHandle, FrameLocator, Page, Playwright, async_playwright
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, InstanceOf, PrivateAttr, model_validator
-
-from browser_use.browser.profile import BrowserProfile
-from browser_use.browser.views import (
-	BrowserError,
-	BrowserStateSummary,
-	TabInfo,
-	URLNotAllowedError,
+from playwright.async_api import (
+	Browser as PlaywrightBrowser,
+	BrowserContext as PlaywrightBrowserContext,
+	ElementHandle,
+	FrameLocator,
+	Page,
+	Playwright,
+	TimeoutError,
+	async_playwright,
 )
+from pydantic import BaseModel, ConfigDict, Field, InstanceOf, PrivateAttr, model_validator, AliasChoices
+from pydantic.fields import FieldInfo
+from playwright._impl._api_structures import ViewportSize
+
+from browser_use.dom.views import DOMElementNode
+from browser_use.browser.views import BrowserError, TabInfo, BrowserStateSummary
+from browser_use.browser.profile import BrowserProfile, DEFAULT_BROWSER_PROFILE, get_display_size
 from browser_use.dom.clickable_element_processor.service import ClickableElementProcessor
 from browser_use.dom.service import DomService
-from browser_use.dom.views import DOMElementNode, SelectorMap
+from browser_use.dom.views import SelectorMap
+from browser_use.exceptions import URLNotAllowedError
+from browser_use.mouse.service import MouseMovementService
+from browser_use.mouse.views import MouseMovementConfig, MouseMovementPattern
 from browser_use.utils import time_execution_async, time_execution_sync
 
 # Check if running in Docker
@@ -121,9 +130,9 @@ class BrowserSession(BaseModel):
 	chrome_pid: int | None = Field(
 		default=None, description='pid of the running chrome process to connect to on localhost (optional)'
 	)
-	playwright: Playwright | PatchrightPlaywright | Playwright | None = Field(
+	playwright: Playwright | None = Field(
 		default=None,
-		description='Playwright library object returned by: await (playwright or patchright).async_playwright().start()',
+		description='Playwright library object returned by: await playwright.async_playwright().start()',
 		exclude=True,
 	)
 	browser: InstanceOf[PlaywrightBrowser] | None = Field(
@@ -159,6 +168,7 @@ class BrowserSession(BaseModel):
 
 	_cached_browser_state_summary: BrowserStateSummary | None = PrivateAttr(default=None)
 	_cached_clickable_element_hashes: CachedClickableElementHashes | None = PrivateAttr(default=None)
+	_mouse_movement_service: Optional[MouseMovementService] = PrivateAttr(default=None)
 
 	@model_validator(mode='after')
 	def apply_session_overrides_to_profile(self) -> Self:
@@ -179,13 +189,24 @@ class BrowserSession(BaseModel):
 
 		return self
 
-	# def __getattr__(self, key: str) -> Any:
-	# 	"""
-	# 	fall back to getting any attrs from the underlying self.browser_profile when not defined on self.
-	# 	(extra kwargs passed e.g. BrowserSession(extra_kwarg=124) on init get saved into self.browser_profile on validation,
-	# 	so this also allows you to read those: browser_session.extra_kwarg => browser_session.browser_profile.extra_kwarg)
-	# 	"""
-	# 	return getattr(self.browser_profile, key)
+	@model_validator(mode='after')
+	def setup_mouse_movement_service(self) -> 'BrowserSession':
+		"""Set up the mouse movement service based on the profile configuration."""
+		if not hasattr(self, '_mouse_movement_service') or self._mouse_movement_service is None:
+			# Create mouse movement config from browser profile settings
+			mouse_config = MouseMovementConfig(
+				enabled=self.browser_profile.use_human_like_mouse,
+				pattern=MouseMovementPattern(self.browser_profile.mouse_movement_pattern),
+				speed_variation=self.browser_profile.mouse_speed_variation,
+				min_movement_time=self.browser_profile.min_mouse_movement_time,
+				max_movement_time=self.browser_profile.max_mouse_movement_time,
+				show_visual_cursor=self.browser_profile.show_visual_cursor,
+			)
+			logger.info(f"🖱️ Setting up mouse movement service with pattern={mouse_config.pattern.value}, enabled={mouse_config.enabled}, visual_cursor={mouse_config.show_visual_cursor}")
+			
+			self._mouse_movement_service = MouseMovementService(config=mouse_config)
+		
+		return self
 
 	async def start(self) -> Self:
 		# finish initializing/validate the browser_profile:
@@ -250,9 +271,7 @@ class BrowserSession(BaseModel):
 		"""Override to customize the set up of the playwright or patchright library object"""
 		self.playwright = self.playwright or await async_playwright().start()
 
-		# if isinstance(self.playwright, PatchrightPlaywright):
-		# 	# patchright handles all its own default args, dont mess with them
-		# 	self.browser_profile.ignore_default_args = True
+		# No longer needed without patchright support
 
 		return self.playwright
 
@@ -626,12 +645,9 @@ class BrowserSession(BaseModel):
 		"""
 		Input text into an element with proper error handling and state management.
 		Handles different types of input fields and ensures proper element state before input.
+		Includes human-like mouse movement if enabled.
 		"""
 		try:
-			# Highlight before typing
-			# if element_node.highlight_index is not None:
-			# 	await self._update_state(focus_element=element_node.highlight_index)
-
 			element_handle = await self.get_locate_element(element_node)
 
 			if element_handle is None:
@@ -656,6 +672,20 @@ class BrowserSession(BaseModel):
 			readonly = await readonly_handle.json_value() if readonly_handle else False
 			disabled = await disabled_handle.json_value() if disabled_handle else False
 
+			page = await self.get_current_page()
+			
+			# Use human-like mouse movement if enabled
+			if self.browser_profile.use_human_like_mouse:
+				# Initialize mouse movement service if needed
+				self.setup_mouse_movement_service()
+				
+				logger.info(f"🖱️ Using human-like mouse movement to position cursor in input element with tag={tag_name}")
+				# Move mouse to element before clicking
+				await self._mouse_movement_service.move_mouse_to_element(page, element_handle)
+				
+				# Small delay before clicking (like a human would)
+				await asyncio.sleep(random.uniform(0.1, 0.3))
+			
 			# always click the element first to make sure it's in the focus
 			await element_handle.click()
 			await asyncio.sleep(0.1)
@@ -663,80 +693,81 @@ class BrowserSession(BaseModel):
 			try:
 				if (await is_contenteditable.json_value() or tag_name == 'input') and not (readonly or disabled):
 					await element_handle.evaluate('el => {el.textContent = ""; el.value = "";}')
-					await element_handle.type(text, delay=5)
+					
+					# Add human-like typing delays if enabled
+					if self.browser_profile.use_human_like_mouse:
+						logger.info(f"🖱️ Using human-like typing for {len(text)} characters with varied delays")
+						# Type with varied delays between characters for realistic typing
+						for char in text:
+							await element_handle.type(char, delay=random.uniform(50, 150))
+							await asyncio.sleep(random.uniform(0.01, 0.05))
+					else:
+						await element_handle.type(text, delay=5)
 				else:
 					await element_handle.fill(text)
 			except Exception:
 				# last resort fallback, assume it's already focused after we clicked on it,
 				# just simulate keypresses on the entire page
-				page = await self.get_current_page()
-				await page.keyboard.type(text)
+				if self.browser_profile.use_human_like_mouse:
+					logger.info(f"🖱️ Fallback: Using human-like typing directly on page for {len(text)} characters")
+					# Type with varied delays between characters for realistic typing
+					for char in text:
+						await page.keyboard.type(char, delay=random.uniform(50, 150))
+						await asyncio.sleep(random.uniform(0.01, 0.05))
+				else:
+					await page.keyboard.type(text)
 
 		except Exception as e:
 			logger.debug(f'❌  Failed to input text into element: {repr(element_node)}. Error: {str(e)}')
 			raise BrowserError(f'Failed to input text into index {element_node.highlight_index}')
 
 	@time_execution_async('--click_element_node')
-	async def _click_element_node(self, element_node: DOMElementNode) -> str | None:
+	async def _click_element_node(self, element_node: DOMElementNode, click_delay: float = None, move_delay: float = None):
 		"""
-		Optimized method to click an element using xpath.
+		Click an element with proper error handling and state management.
+		Handles retries, waiting for element stability, and human-like mouse movements if enabled.
 		"""
-		page = await self.get_current_page()
 		try:
-			# Highlight before clicking
-			# if element_node.highlight_index is not None:
-			# 	await self._update_state(focus_element=element_node.highlight_index)
-
+			logger.debug(f"🖱️ Clicking element: {repr(element_node)}")
 			element_handle = await self.get_locate_element(element_node)
 
 			if element_handle is None:
-				raise Exception(f'Element: {repr(element_node)} not found')
+				raise BrowserError(f'Element: {repr(element_node)} not found')
 
-			async def perform_click(click_func):
-				"""Performs the actual click, handling both download
-				and navigation scenarios."""
-				if self.browser_profile.save_downloads_path:
-					try:
-						# Try short-timeout expect_download to detect a file download has been been triggered
-						async with page.expect_download(timeout=5000) as download_info:
-							await click_func()
-						download = await download_info.value
-						# Determine file path
-						suggested_filename = download.suggested_filename
-						unique_filename = await self._get_unique_filename(
-							self.browser_profile.save_downloads_path, suggested_filename
-						)
-						download_path = os.path.join(self.browser_profile.save_downloads_path, unique_filename)
-						await download.save_as(download_path)
-						logger.debug(f'⬇️  Download triggered. Saved file to: {download_path}')
-						return download_path
-					except TimeoutError:
-						# If no download is triggered, treat as normal click
-						logger.debug('No download triggered within timeout. Checking navigation...')
-						await page.wait_for_load_state()
-						await self._check_and_handle_navigation(page)
-				else:
-					# Standard click logic if no download is expected
-					await click_func()
-					await page.wait_for_load_state()
-					await self._check_and_handle_navigation(page)
-
+			# Ensure element is ready
 			try:
-				return await perform_click(lambda: element_handle.click(timeout=1500))
-			except URLNotAllowedError as e:
-				raise e
-			except Exception:
-				try:
-					return await perform_click(lambda: page.evaluate('(el) => el.click()', element_handle))
-				except URLNotAllowedError as e:
-					raise e
-				except Exception as e:
-					raise Exception(f'Failed to click element: {str(e)}')
+				await element_handle.wait_for_element_state('stable', timeout=1000)
+				is_visible = await self._is_visible(element_handle)
 
-		except URLNotAllowedError as e:
-			raise e
+				if not is_visible:
+					raise BrowserError(f'Element: {repr(element_node)} is not visible')
+			except Exception as e:
+				logger.debug(f"Element state error: {e}")
+				raise BrowserError(f'Element: {repr(element_node)} is not ready for click: {str(e)}')
+
+			# Add visual cursor if enabled
+			if hasattr(self, '_mouse_movement_service') and self._mouse_movement_service.config.show_visual_cursor:
+				page = await self.get_current_page()
+				await self._mouse_movement_service.create_visual_cursor(page)
+
+			# Use human-like mouse movement if enabled
+			if hasattr(self, '_mouse_movement_service') and self._mouse_movement_service.config.enabled:
+				logger.debug(f"Using human-like mouse movement to click {repr(element_node)}")
+				await self._click_with_mouse_movement(element_handle, click_delay, move_delay)
+			else:
+				logger.debug(f"Using standard click on {repr(element_node)}")
+				await element_handle.click(delay=click_delay or 0)
+
+			# Wait for any navigation or animations to complete
+			try:
+				await self.page_client.wait_for_load_state('networkidle', timeout=3000)
+			except Exception as e:
+				logger.debug(f"Wait for load state error (non-critical): {e}")
+
+			return True
 		except Exception as e:
-			raise Exception(f'Failed to click element: {repr(element_node)}. Error: {str(e)}')
+			logger.error(f"Click error: {e}")
+			raise BrowserError(f'Failed to click element: {repr(element_node)}: {str(e)}')
 
 	@time_execution_async('--get_tabs_info')
 	async def get_tabs_info(self) -> list[TabInfo]:
@@ -1910,3 +1941,51 @@ class BrowserSession(BaseModel):
 			new_filename = f'{base} ({counter}){ext}'
 			counter += 1
 		return new_filename
+
+	async def _click_with_mouse_movement(self, element_handle, click_delay=None, move_delay=None):
+		"""Use the mouse movement service to move to an element and click it with visual feedback."""
+		page = await self.get_current_page()
+		
+		# Get element position and size
+		box = await element_handle.bounding_box()
+		if not box:
+			raise BrowserError("Cannot get element bounding box for mouse movement")
+		
+		# Calculate target position (center of element)
+		target_x = box["x"] + box["width"] / 2
+		target_y = box["y"] + box["height"] / 2
+		
+		# Update visual cursor if enabled
+		if self._mouse_movement_service.config.show_visual_cursor:
+			# First create cursor if not already created
+			await self._mouse_movement_service.create_visual_cursor(page)
+			
+			# Get current mouse position to start movement
+			current_position = await page.evaluate("""
+				() => { 
+					return { 
+						x: window.__browserUseCursorX || 0, 
+						y: window.__browserUseCursorY || 0 
+					}; 
+				}
+			""")
+			start_x = current_position.get("x", 0)
+			start_y = current_position.get("y", 0)
+			
+			# Generate path points for visual cursor
+			path_points = self._mouse_movement_service._generate_path(
+				start_x, start_y, target_x, target_y
+			)
+			
+			# Move cursor along path
+			for point in path_points:
+				await self._mouse_movement_service.update_visual_cursor(page, point[0], point[1])
+				await asyncio.sleep(move_delay or 0.01)
+			
+			# Show click effect
+			await self._mouse_movement_service.update_visual_cursor(page, target_x, target_y, clicking=True)
+		
+		# Perform the actual click using the service
+		await self._mouse_movement_service.click_element_with_movement(
+			page, element_handle, click_delay=click_delay
+		)

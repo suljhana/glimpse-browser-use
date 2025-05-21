@@ -604,6 +604,32 @@ class BrowserProfile(BrowserConnectArgs, BrowserLaunchPersistentContextArgs, Bro
 	)
 	# uploads_dir: Path | None = Field(default=None, description='Directory for uploads (defaults to downloads_dir if not set).')
 
+	# --- Human-like behavior settings ---
+	use_human_like_mouse: bool = Field(
+		default=False,  # Default to false to maintain backward compatibility
+		description="Enable human-like mouse movements before interactions"
+	)
+	mouse_movement_pattern: str = Field(
+		default="linear",
+		description="Type of mouse movement pattern to use: linear, bezier, or human"
+	)
+	mouse_speed_variation: float = Field(
+		default=0.3,
+		description="Amount of speed variation (0-1) for more human-like movement"
+	)
+	min_mouse_movement_time: float = Field(
+		default=0.3,
+		description="Minimum time in seconds to complete a mouse movement"
+	)
+	max_mouse_movement_time: float = Field(
+		default=1.0,
+		description="Maximum time in seconds to complete a mouse movement"
+	)
+	show_visual_cursor: bool = Field(
+		default=False,
+		description="Show a visual cursor in the browser to visualize simulated mouse movements"
+	)
+
 	def __repr__(self) -> str:
 		short_dir = str(self.user_data_dir).replace(str(Path('~').expanduser()), '~')
 		return f'BrowserProfile(user_data_dir={short_dir}, headless={self.headless})'
@@ -746,3 +772,6 @@ class BrowserProfile(BrowserConnectArgs, BrowserLaunchPersistentContextArgs, Bro
 			self.viewport = None
 			self.device_scale_factor = None
 			self.screen = None
+
+# Create a default browser profile
+DEFAULT_BROWSER_PROFILE = BrowserProfile()
